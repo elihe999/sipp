@@ -21,19 +21,8 @@
 #define __SIPP_SOCKET_H__
 
 #ifdef USE_OPENSSL
-#include "sslcommon.h"
-
-enum ssl_init_status {
-    SSL_INIT_NORMAL, /* 0   Normal completion    */
-    SSL_INIT_ERROR   /* 1   Unspecified error    */
-};
-
-extern SSL_CTX *sip_trp_ssl_ctx;
-extern SSL_CTX *sip_trp_ssl_ctx_client;
-const char *sip_tls_error_string(SSL *ssl, int size);
-ssl_init_status FI_init_ssl_context (void);
-
-#endif // USE_OPENSSL
+#include "sslsocket.hpp"
+#endif
 
 /**
  * On some systems you must pass the exact sockaddr struct size to
@@ -74,6 +63,7 @@ class SIPpSocket {
 public:
     SIPpSocket(bool use_ipv6, int transport, int fd, int accepting);
     static SIPpSocket* new_sipp_call_socket(bool use_ipv6, int transport, bool *existing);
+    void set_bind_port(int bind_port);
 
     int connect(struct sockaddr_storage* dest = NULL);
     int reconnect();
@@ -106,6 +96,7 @@ public:
     bool ss_control;        /* Is this a control socket? */
     int ss_fd;              /* The underlying file descriptor for this socket. */
     int ss_port;            /* The port used by this socket */
+    int ss_bind_port;       /* Optional local port used by this socket */
     void *ss_comp_state;    /* The compression state. */
 
     bool ss_changed_dest;   /* Has the destination changed from default. */
@@ -196,7 +187,7 @@ struct socketbuf {
 #define WS_BUFFER 2 /* Buffer the message if there is no room for writing the message. */
 
 
-#if defined (__hpux) || defined (__alpha) && !defined (__FreeBSD__)
+#if defined (__hpux) || (defined (__alpha) && !defined (__FreeBSD__) && !defined (__linux__))
 #define sipp_socklen_t int
 #else
 #define sipp_socklen_t socklen_t

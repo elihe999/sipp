@@ -212,7 +212,7 @@ void call::get_remote_media_addr(std::string const &msg)
 /******* Extract RTP remote media infomartion from SDP  *******/
 /***** Similar to the routines used by the PCAP play code *****/
 
-void call::extract_rtp_remote_addr(char* msg)
+void call::extract_rtp_remote_addr(const char* msg)
 {
     int ip_ver;
     int audio_port = 0;
@@ -404,10 +404,6 @@ void call::init(scenario * call_scenario, SIPpSocket *socket, struct sockaddr_st
     dialog_authentication = NULL;
     dialog_challenge_type = 0;
 
-#ifdef USE_OPENSSL
-    m_ctx_ssl = NULL;
-    m_bio = NULL;
-#endif
 #ifdef RTP_STREAM
     /* check and warn on rtpstream_new_call result? -> error alloc'ing mem */
     rtpstream_new_call(&rtpstream_callinfo);
@@ -741,9 +737,7 @@ bool call::connect_socket_if_needed()
             return true;
         }
 
-        memset(&saddr, 0, sizeof(struct sockaddr_storage));
-        memcpy(&saddr, local_addr_storage->ai_addr, local_addr_storage->ai_addrlen);
-
+        memcpy(&saddr, &local_addr_storage, sizeof(struct sockaddr_storage));
         if (use_ipv6) {
             saddr.ss_family       = AF_INET6;
         } else {
@@ -1153,6 +1147,38 @@ void call::terminate(CStat::E_Action reason)
         case call::E_AR_NO_ERROR:
         case call::E_AR_STOP_CALL:
             /* Do nothing. */
+            break;
+        case call::E_AR_TEST_DOESNT_MATCH:
+            computeStat(CStat::E_CALL_FAILED);
+            computeStat(CStat::E_FAILED_TEST_DOESNT_MATCH);
+            if (deadcall_wait && !initCall) {
+                sprintf(reason_str, "test failure at index %d", msg_index);
+                new deadcall(id, reason_str);
+            }
+            break;
+        case call::E_AR_TEST_SHOULDNT_MATCH:
+            computeStat(CStat::E_CALL_FAILED);
+            computeStat(CStat::E_FAILED_TEST_SHOULDNT_MATCH);
+            if (deadcall_wait && !initCall) {
+                sprintf(reason_str, "test succeeded, but shouldn't at index %d", msg_index);
+                new deadcall(id, reason_str);
+            }
+            break;
+        case call::E_AR_STRCMP_DOESNT_MATCH:
+            computeStat(CStat::E_CALL_FAILED);
+            computeStat(CStat::E_FAILED_STRCMP_DOESNT_MATCH);
+            if (deadcall_wait && !initCall) {
+                sprintf(reason_str, "test failure at index %d", msg_index);
+                new deadcall(id, reason_str);
+            }
+            break;
+        case call::E_AR_STRCMP_SHOULDNT_MATCH:
+            computeStat(CStat::E_CALL_FAILED);
+            computeStat(CStat::E_FAILED_STRCMP_SHOULDNT_MATCH);
+            if (deadcall_wait && !initCall) {
+                sprintf(reason_str, "test succeeded, but shouldn't at index %d", msg_index);
+                new deadcall(id, reason_str);
+            }
             break;
         }
     } else {
@@ -1681,7 +1707,7 @@ void set_default_message(const char *which, char *msg)
     ERROR("Internal Error: Unknown default message: %s!", which);
 }
 
-bool call::process_unexpected(char * msg)
+bool call::process_unexpected(const char* msg)
 {
     char buffer[MAX_HEADER_LEN];
     char *desc = buffer;
@@ -1997,7 +2023,7 @@ char* call::createSendingMessage(SendingMessage *src, int P_index, char *msg_buf
         }
         break;
         case E_Message_Media_IP:
-            dest += snprintf(dest, left, "%s", media_ip_escaped);
+            dest += snprintf(dest, left, "%s", media_ip);
             break;
         case E_Message_Media_Port:
         case E_Message_Auto_Media_Port: {
@@ -2532,17 +2558,17 @@ bool call::check_peer_src(char * msg, int search_index)
 }
 
 
-void call::extract_cseq_method(char* method, char* msg)
+void call::extract_cseq_method(char* method, const char* msg)
 {
-    char* cseq ;
+    const char* cseq;
     if ((cseq = strstr (msg, "CSeq"))) {
-        char * value ;
-        if (( value = strchr (cseq,  ':'))) {
+        const char* value;
+        if ((value = strchr(cseq, ':'))) {
             value++;
-            while ( isspace(*value)) value++;  // ignore any white spaces after the :
-            while ( !isspace(*value)) value++;  // ignore the CSEQ number
-            while ( isspace(*value)) value++;  // ignore spaces after CSEQ number
-            char *end = value;
+            while (isspace(*value)) value++;  // ignore any white spaces after the :
+            while (!isspace(*value)) value++;  // ignore the CSEQ number
+            while (isspace(*value)) value++;  // ignore spaces after CSEQ number
+            const char* end = value;
             int nbytes = 0;
             /* A '\r' terminates the line, so we want to catch that too. */
             while ((*end != '\r') && (*end != '\n')) {
@@ -2555,7 +2581,7 @@ void call::extract_cseq_method(char* method, char* msg)
     }
 }
 
-void call::extract_transaction(char* txn, char* msg)
+void call::extract_transaction(char* txn, const char* msg)
 {
     char *via = get_header_content(msg, "via:");
     if (!via) {
@@ -2666,18 +2692,21 @@ bool call::matches_scenario(unsigned int index, int reply_code, char * request, 
 {
     message *curmsg = call_scenario->messages[index];
 
-    if ((curmsg -> recv_request)) {
+    if ((curmsg->recv_request)) {
         if (curmsg->regexp_match) {
-            if (curmsg -> regexp_compile == NULL) {
+            if (curmsg->regexp_compile == NULL) {
                 regex_t *re = new regex_t;
-                if (regcomp(re, curmsg -> recv_request, REG_EXTENDED|REG_NOSUB)) {
+                /* No regex match position needed (NOSUB), we're simply
+                 * looking for the <request method="INVITE|REGISTER"../>
+                 * regex. */
+                if (regcomp(re, curmsg->recv_request, REGCOMP_PARAMS|REG_NOSUB)) {
                     ERROR("Invalid regular expression for index %d: %s", index, curmsg->recv_request);
                 }
-                curmsg -> regexp_compile = re;
+                curmsg->regexp_compile = re;
             }
-            return !regexec(curmsg -> regexp_compile, request, (size_t)0, NULL, 0);
+            return !regexec(curmsg->regexp_compile, request, (size_t)0, NULL, REGEXEC_PARAMS);
         } else {
-            return !strcmp(curmsg -> recv_request, request);
+            return !strcmp(curmsg->recv_request, request);
         }
     } else if (curmsg->recv_response && (curmsg->recv_response == reply_code)) {
         /* This is a potential candidate, we need to match transactions. */
@@ -2702,20 +2731,20 @@ bool call::matches_scenario(unsigned int index, int reply_code, char * request, 
     return false;
 }
 
-void call::queue_up(char *msg)
+void call::queue_up(const char* msg)
 {
     free(queued_msg);
     queued_msg = strdup(msg);
 }
 
-bool call::process_incoming(char * msg, struct sockaddr_storage *src)
+bool call::process_incoming(const char* msg, const struct sockaddr_storage* src)
 {
     int             reply_code;
     static char     request[65];
     char            responsecseqmethod[65];
     char            txn[MAX_HEADER_LEN];
     unsigned long   cookie = 0;
-    char          * ptr;
+    const char*     ptr;
     int             search_index;
     bool            found = false;
     T_ActionResult  actionResult;
@@ -2847,13 +2876,13 @@ bool call::process_incoming(char * msg, struct sockaddr_storage *src)
         // extract the cseq method from the response
         extract_cseq_method (responsecseqmethod, msg);
         extract_transaction (txn, msg);
-    } else if((ptr = strchr(msg, ' '))) {
-        if((ptr - msg) < 64) {
+    } else if ((ptr = strchr(msg, ' '))) {
+        if ((ptr - msg) < 64) {
             memcpy(request, msg, ptr - msg);
             request[ptr - msg] = 0;
             // Check if we received an ACK => call established
-            if (strcmp(request,"ACK")==0) {
-                call_established=true;
+            if (strcmp(request,"ACK") == 0) {
+                call_established = true;
             }
 #ifdef PCAPPLAY
             /* In case of INVITE or re-INVITE, ACK or PRACK
@@ -2877,12 +2906,12 @@ bool call::process_incoming(char * msg, struct sockaddr_storage *src)
     }
 
     /* Try to find it in the expected non mandatory responses
-     * until the first mandatory response  in the scenario */
-    for(search_index = msg_index;
+     * until the first mandatory response in the scenario */
+    for (search_index = msg_index;
             search_index < (int)call_scenario->messages.size();
             search_index++) {
-        if(!matches_scenario(search_index, reply_code, request, responsecseqmethod, txn)) {
-            if(call_scenario->messages[search_index] -> optional) {
+        if (!matches_scenario(search_index, reply_code, request, responsecseqmethod, txn)) {
+            if (call_scenario->messages[search_index]->optional) {
                 continue;
             }
             /* The received message is different for the expected one */
@@ -2898,13 +2927,15 @@ bool call::process_incoming(char * msg, struct sockaddr_storage *src)
     }
 
     /* Try to find it in the old non-mandatory receptions */
-    if(!found) {
+    if (!found) {
         bool contig = true;
         for(search_index = msg_index - 1;
                 search_index >= 0;
                 search_index--) {
-            if (call_scenario->messages[search_index]->optional == OPTIONAL_FALSE) contig = false;
-            if(matches_scenario(search_index, reply_code, request, responsecseqmethod, txn)) {
+            if (call_scenario->messages[search_index]->optional == OPTIONAL_FALSE) {
+                contig = false;
+            }
+            if (matches_scenario(search_index, reply_code, request, responsecseqmethod, txn)) {
                 if (contig || call_scenario->messages[search_index]->optional == OPTIONAL_GLOBAL) {
                     found = true;
                     break;
@@ -3214,18 +3245,18 @@ double call::get_rhs(CAction *currentAction)
     }
 }
 
-call::T_ActionResult call::executeAction(char * msg, message *curmsg)
+call::T_ActionResult call::executeAction(const char* msg, message* curmsg)
 {
     CActions*  actions;
     CAction*   currentAction;
 
     actions = curmsg->M_actions;
     // looking for action to do on this message
-    if(actions == NULL) {
+    if (actions == NULL) {
         return(call::E_AR_NO_ERROR);
     }
 
-    for(int i=0; i<actions->getActionSize(); i++) {
+    for (int i = 0; i < actions->getActionSize(); i++) {
         currentAction = actions->getAction(i);
         if(currentAction == NULL) {
             continue;
@@ -3235,7 +3266,7 @@ call::T_ActionResult call::executeAction(char * msg, message *curmsg)
             char msgPart[MAX_SUB_MESSAGE_LENGTH];
 
             /* Where to look. */
-            char *haystack;
+            const char* haystack;
 
             if(currentAction->getLookingPlace() == CAction::E_LP_HDR) {
                 extractSubMessage (msg,
@@ -3460,8 +3491,8 @@ call::T_ActionResult call::executeAction(char * msg, message *curmsg)
             }
         } else if (currentAction->getActionType() == CAction::E_AT_VERIFY_AUTH) {
             bool result;
-            char *lf;
-            char *end;
+            const char* lf;
+            const char* end;
 
             lf = strchr(msg, '\n');
             end = strchr(msg, ' ');
@@ -3483,7 +3514,7 @@ call::T_ActionResult call::executeAction(char * msg, message *curmsg)
                 tmp= createSendingMessage(currentAction->getMessage(1), -2 /* do not add crlf*/);
                 char *password = strdup(tmp);
                 /* Need the body for length and auth-int calculation */
-                char *body;
+                const char *body;
                 const char *auth_body = NULL;
                 body = strstr(msg, "\r\n\r\n");
                 if (body) {
@@ -3537,18 +3568,71 @@ call::T_ActionResult call::executeAction(char * msg, message *curmsg)
                 M_callVariableTable->getVar(currentAction->getVarId())->setDouble(value / operand);
             }
         } else if (currentAction->getActionType() == CAction::E_AT_VAR_TEST) {
-            double value = currentAction->compare(M_callVariableTable);
-            M_callVariableTable->getVar(currentAction->getVarId())->setBool(value);
-        } else if (currentAction->getActionType() == CAction::E_AT_VAR_STRCMP) {
-            char *rhs = M_callVariableTable->getVar(currentAction->getVarInId())->getString();
-            char *lhs;
-            if (currentAction->getVarIn2Id()) {
-                lhs = M_callVariableTable->getVar(currentAction->getVarIn2Id())->getString();
-            } else {
-                lhs = currentAction->getStringValue();
+            bool value = currentAction->compare(M_callVariableTable);
+            if ((currentAction->getCheckIt() && !value) ||
+                (currentAction->getCheckItInverse() && value)
+            ) {
+                double lhs = M_callVariableTable->getVar(currentAction->getVarInId())->getDouble();
+                double rhs = currentAction->getVarIn2Id() ?
+                    M_callVariableTable->getVar(currentAction->getVarIn2Id())->getDouble() :
+                    currentAction->getDoubleValue();
+                char *lhsName = call_scenario->allocVars->getName(currentAction->getVarInId());
+                const char *rhsName = "";
+                if (currentAction->getVarIn2Id()) {
+                    rhsName = call_scenario->allocVars->getName(currentAction->getVarIn2Id());
+                }
+                const char *_inverse = currentAction->getCheckIt() ? "" : "_inverse";
+                call::T_ActionResult result = currentAction->getCheckIt() ? call::E_AR_TEST_DOESNT_MATCH : call::E_AR_TEST_SHOULDNT_MATCH;
+
+                WARNING("test \"%s:%f %s %s:%f\" with check_it%s failed",
+                    lhsName,
+                    lhs,
+                    currentAction->comparatorToString(currentAction->getComparator()),
+                    rhsName,
+                    rhs,
+                    _inverse
+                );
+                return(result);
             }
-            int value = strcmp(rhs, lhs);
-            M_callVariableTable->getVar(currentAction->getVarId())->setDouble((double)value);
+            // "assign_to" is optional when "check_it" or "check_it_inverse" set
+            if (currentAction->getVarId() ||
+                (!currentAction->getCheckIt() && !currentAction->getCheckItInverse())
+            ) {
+                M_callVariableTable->getVar(currentAction->getVarId())->setBool(value);
+            }
+        } else if (currentAction->getActionType() == CAction::E_AT_VAR_STRCMP) {
+            char *lhs = M_callVariableTable->getVar(currentAction->getVarInId())->getString();
+            char *rhs = currentAction->getVarIn2Id() ?
+                M_callVariableTable->getVar(currentAction->getVarIn2Id())->getString() :
+                currentAction->getStringValue();
+            int value = strcmp(lhs, rhs);
+            if ((currentAction->getCheckIt() && value) ||
+                (currentAction->getCheckItInverse() && !value)
+            ) {
+                char *lhsName = call_scenario->allocVars->getName(currentAction->getVarInId());
+                const char *rhsName = "";
+                if (currentAction->getVarIn2Id()) {
+                    rhsName = call_scenario->allocVars->getName(currentAction->getVarIn2Id());
+                }
+                const char *_inverse = currentAction->getCheckIt() ? "" : "_inverse";
+                call::T_ActionResult result = currentAction->getCheckIt() ? call::E_AR_STRCMP_DOESNT_MATCH : call::E_AR_STRCMP_SHOULDNT_MATCH;
+
+                WARNING("strcmp %s:\"%s\" and %s:\"%s\" with check_it%s returned %d",
+                    lhsName,
+                    lhs,
+                    rhsName,
+                    rhs,
+                    _inverse,
+                    value
+                );
+                return(result);
+            }
+            // "assign_to" is optional when "check_it" or "check_it_inverse" set
+            if (currentAction->getVarId() ||
+                (!currentAction->getCheckIt() && !currentAction->getCheckItInverse())
+            ) {
+                M_callVariableTable->getVar(currentAction->getVarId())->setDouble((double)value);
+            }
         } else if (currentAction->getActionType() == CAction::E_AT_VAR_TRIM) {
             CCallVariable *var = M_callVariableTable->getVar(currentAction->getVarId());
             char *in = var->getString();
@@ -3713,10 +3797,10 @@ call::T_ActionResult call::executeAction(char * msg, message *curmsg)
     return(call::E_AR_NO_ERROR);
 }
 
-void call::extractSubMessage(char * msg, char * matchingString, char* result, bool case_indep, int occurrence, bool headers)
+void call::extractSubMessage(const char* msg, char* matchingString, char* result, bool case_indep, int occurrence, bool headers)
 {
 
-    char *ptr, *ptr1;
+    const char *ptr, *ptr1;
     int sizeOf;
     int i = 0;
     int len = strlen(matchingString);
@@ -3801,7 +3885,7 @@ void call::getFieldFromInputFile(const char *fileName, int field, SendingMessage
     dest += inFiles[fileName]->getField(line, field, dest, SIPP_MAX_MSG_SIZE);
 }
 
-call::T_AutoMode call::checkAutomaticResponseMode(char * P_recv)
+call::T_AutoMode call::checkAutomaticResponseMode(char* P_recv)
 {
     if (strcmp(P_recv, "BYE")==0) {
         return E_AM_UNEXP_BYE;
@@ -3834,7 +3918,7 @@ void call::setLastMsg(const char *msg)
     strcpy(last_recv_msg, msg);
 }
 
-bool call::automaticResponseMode(T_AutoMode P_case, char * P_recv)
+bool call::automaticResponseMode(T_AutoMode P_case, const char* P_recv)
 {
 
     int res ;

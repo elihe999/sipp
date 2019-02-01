@@ -138,7 +138,7 @@ struct sipp_option options_table[] = {
         "- ui: UDP with one socket per IP address. The IP addresses must be defined in the injection file.\n"
         "- t1: TCP with one socket,\n"
         "- tn: TCP with one socket per call,\n"
-#ifdef USE_OPENSSL
+#ifdef USE_TLS
         "- l1: TLS with one socket,\n"
         "- ln: TLS with one socket per call,\n"
 #endif
@@ -161,14 +161,16 @@ struct sipp_option options_table[] = {
     {"reconnect_sleep", "How long (in milliseconds) to sleep between the close and reconnect?", SIPP_OPTION_TIME_MS, &reset_sleep, 1},
     {"rsa", "Set the remote sending address to host:port for sending the messages.", SIPP_OPTION_RSA, NULL, 1},
 
-#ifdef USE_OPENSSL
+#ifdef USE_TLS
     {"tls_cert", "Set the name for TLS Certificate file. Default is 'cacert.pem", SIPP_OPTION_STRING, &tls_cert_name, 1},
     {"tls_key", "Set the name for TLS Private Key file. Default is 'cakey.pem'", SIPP_OPTION_STRING, &tls_key_name, 1},
     {"tls_crl", "Set the name for Certificate Revocation List file. If not specified, X509 CRL is not activated.", SIPP_OPTION_STRING, &tls_crl_name, 1},
+    {"tls_version", "Set the TLS protocol version to use (1.0, 1.1, 1.2) -- default is autonegotiate", SIPP_OPTION_FLOAT, &tls_version, 1},
 #else
     {"tls_cert", NULL, SIPP_OPTION_NEED_SSL, NULL, 1},
     {"tls_key", NULL, SIPP_OPTION_NEED_SSL, NULL, 1},
     {"tls_crl", NULL, SIPP_OPTION_NEED_SSL, NULL, 1},
+    {"tls_version", NULL, SIPP_OPTION_NEED_SSL, NULL, 1},
 #endif
 
 #ifdef USE_SCTP
@@ -437,7 +439,7 @@ void timeout_alarm(int /*param*/)
 
 /* Send loop & trafic generation*/
 
-static bool traffic_thread()
+static void traffic_thread()
 {
     /* create the file */
     char L_file_name[MAX_PATH];
@@ -491,15 +493,22 @@ static bool traffic_thread()
                 /* Force exit: abort all calls */
                 abort_all_tasks();
             }
-            /* Quitting and no more openned calls, close all */
+            /* Quitting and no more opened calls, close all */
             if (!main_scenario->stats->GetStat(CStat::CPT_C_CurrentCall)) {
                 /* We can have calls that do not count towards our open-call count (e.g., dead calls). */
                 abort_all_tasks();
 #ifdef RTP_STREAM
                 rtpstream_shutdown();
 #endif
-                for (unsigned i = 0; i < pollnfds; i++) {
+                /* Reverse order shutdown, because deleting reorders the
+                 * sockets list. */
+                for (int i = pollnfds - 1; i >= 0; --i) {
                     sockets[i]->close();
+                    if (sockets[i] == ctrl_socket) {
+                        ctrl_socket = NULL;
+                    } else if (sockets[i] == stdin_socket) {
+                        stdin_socket = NULL;
+                    }
                 }
 
                 screentask::report(true);
@@ -507,7 +516,7 @@ static bool traffic_thread()
                 if (useScreenf == 1) {
                     print_screens();
                 }
-                return false;
+                return;
             }
         }
 
@@ -543,9 +552,9 @@ static bool traffic_thread()
         task * last = NULL;
 
         task_list::iterator iter;
-        for(iter = running_tasks->begin(); iter != running_tasks->end(); iter++) {
+        for (iter = running_tasks->begin(); iter != running_tasks->end(); iter++) {
             if (last) {
-                last -> run();
+                last->run();
                 if (sockets_pending_reset.begin() != sockets_pending_reset.end()) {
                     last = NULL;
                     break;
@@ -557,7 +566,7 @@ static bool traffic_thread()
             }
         }
         if (last) {
-            last -> run();
+            last->run();
         }
         while (sockets_pending_reset.begin() != sockets_pending_reset.end()) {
             (*(sockets_pending_reset.begin()))->reset_connection();
@@ -569,7 +578,7 @@ static bool traffic_thread()
         /* Receive incoming messages */
         SIPpSocket::pollset_process(running_tasks->empty());
     }
-    return true;
+    assert(0);
 }
 
 /*************** RTP ECHO THREAD ***********************/
@@ -618,7 +627,7 @@ static void rtp_echo_thread(void* param)
             return;
         }
 
-        if (*(int*)param == media_socket) {
+        if (*(int*)param == media_socket_audio) {
             rtp_pckts++;
             rtp_bytes += ns;
         } else {
@@ -1059,11 +1068,119 @@ static void set_scenario(const char* name)
     }
 }
 
+/**
+ * Create and bind media_socket_audio, media_socket_video for RTP and
+ * RCTP on try_port and try_port+2.
+ *
+ * Sets: media_socket_audio and media_socket_audio.
+ */
+static int bind_rtp_sockets(struct sockaddr_storage* media_sa, int try_port, int last_attempt)
+{
+    /* Create RTP sockets for audio and video. */
+    if ((media_socket_audio = socket(media_sa->ss_family, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
+        ERROR_NO("Unable to create the audio RTP socket");
+    }
+
+    if (media_sa->ss_family == AF_INET) {
+        (_RCAST(struct sockaddr_in*, media_sa))->sin_port = htons(try_port);
+    } else {
+        (_RCAST(struct sockaddr_in6*, media_sa))->sin6_port = htons(try_port);
+    }
+
+    if (::bind(media_socket_audio, (sockaddr*)media_sa, socklen_from_addr(media_sa)) != 0) {
+        if (last_attempt) {
+            ERROR_NO("Unable to bind audio RTP socket (IP=%s, port=%d)", media_ip, try_port);
+        }
+        ::close(media_socket_audio);
+        media_socket_audio = -1;
+        return -1;
+    }
+
+    /* Create and bind the second/video socket to try_port+2 */
+    /* (+1 is reserved for RTCP) */
+    if ((media_socket_video = socket(media_sa->ss_family, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
+        ERROR_NO("Unable to create the video RTP socket");
+    }
+
+    if (media_sa->ss_family == AF_INET) {
+        (_RCAST(struct sockaddr_in*, media_sa))->sin_port = htons(try_port + 2);
+    } else {
+        (_RCAST(struct sockaddr_in6*, media_sa))->sin6_port = htons(try_port + 2);
+    }
+
+    if (::bind(media_socket_video, (sockaddr*)media_sa, socklen_from_addr(media_sa)) != 0) {
+        if (last_attempt) {
+            ERROR_NO("Unable to bind video RTP socket (IP=%s, port=%d)",
+                     media_ip, try_port + 2);
+        }
+        ::close(media_socket_audio);
+        ::close(media_socket_video);
+        media_socket_audio = media_socket_video = -1;
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * Set a bunch of globals and bind audio and video rtp sockets.
+ *
+ * Sets: media_ip, media_port, media_ip_is_ipv6, media_socket_audio,
+ * media_socket_video.
+ */
+static void setup_media_sockets()
+{
+    struct addrinfo hints = {0,};
+    struct addrinfo* local_addr;
+    struct sockaddr_storage media_sockaddr = {0,};
+
+    hints.ai_flags  = AI_PASSIVE;
+    hints.ai_family = PF_UNSPEC; /* use local_ip_is_ipv6 as hint? */
+
+    /* Defaults for media sockets */
+    if (media_ip[0] == '\0') {
+        strcpy(media_ip, local_ip);
+    }
+    // assert that an IPv6 'media_ip' is not surrounded by brackets?
+
+    /* Resolving local IP */
+    if (getaddrinfo(media_ip,
+                    NULL,
+                    &hints,
+                    &local_addr) != 0) {
+        ERROR("Unknown RTP address '%s'.\n"
+              "Use 'sipp -h' for details", media_ip);
+    }
+    memcpy(&media_sockaddr, local_addr->ai_addr,
+           socklen_from_addr(_RCAST(struct sockaddr_storage*, local_addr->ai_addr)));
+    freeaddrinfo(local_addr);
+
+    media_ip_is_ipv6 = (media_sockaddr.ss_family == AF_INET6);
+
+    int try_counter;
+    int max_tries = user_media_port ? 1 : 100;
+    media_port = user_media_port ? user_media_port : DEFAULT_MEDIA_PORT;
+    media_socket_audio = media_socket_video = -1;
+    for (try_counter = 1; try_counter <= max_tries; try_counter++) {
+        int last_attempt = (try_counter == max_tries);
+
+        if (bind_rtp_sockets(&media_sockaddr, media_port, last_attempt) == 0) {
+            break;
+        }
+
+        // Old RFC 3551 says:
+        // > RTP data SHOULD be carried on an even UDP port number and
+        // > the corresponding RTCP packets SHOULD be carried on the
+        // > next higher (odd) port number.
+        // So, try only even numbers.
+        media_port += 2;
+    }
+}
+
 /* Main */
 int main(int argc, char *argv[])
 {
     int                  argi = 0;
-    struct sockaddr_storage   media_sockaddr;
     pthread_t pthread2_id = 0, pthread3_id = 0;
     unsigned int         generic_count = 0;
     bool                 slave_masterSet = false;
@@ -1103,13 +1220,12 @@ int main(int argc, char *argv[])
     screen_set_exename("sipp");
 
     pid = getpid();
-    memset(local_ip, 0, 40);
+    memset(local_ip, 0, sizeof(local_ip));
 #ifdef USE_SCTP
-    memset(multihome_ip, 0, 40);
+    memset(multihome_ip, 0, sizeof(multihome_ip));
 #endif
-    memset(media_ip, 0, 40);
-    memset(control_ip, 0, 40);
-    memset(media_ip_escaped, 0, 42);
+    memset(media_ip, 0, sizeof(media_ip));
+    memset(control_ip, 0, sizeof(control_ip));
 
     /* Initialize the tolower table. */
     init_tolower_table();
@@ -1148,7 +1264,7 @@ int main(int argc, char *argv[])
                 printf("\n %s.\n\n",
                        /* SIPp v1.2.3-TLS-PCAP */
                        "SIPp " SIPP_VERSION
-#ifdef USE_OPENSSL
+#ifdef USE_TLS
                        "-TLS"
 #endif
 #ifdef USE_SCTP
@@ -1304,9 +1420,9 @@ int main(int argc, char *argv[])
 #endif
                     break;
                 case 'l':
-#ifdef USE_OPENSSL
+#ifdef USE_TLS
                     transport = T_TLS;
-                    if (init_OpenSSL() != 1) {
+                    if (TLS_init() != 1) {
                         printf("OpenSSL Initialization problem\n");
                         exit(-1);
                     }
@@ -1666,8 +1782,8 @@ int main(int argc, char *argv[])
         set_scenario("sipp");
     }
 
-#ifdef USE_OPENSSL
-    if ((transport == T_TLS) && (FI_init_ssl_context() != SSL_INIT_NORMAL)) {
+#ifdef USE_TLS
+    if ((transport == T_TLS) && (TLS_init_context() != TLS_INIT_NORMAL)) {
         ERROR("FI_init_ssl_context() failed");
     }
 #endif
@@ -1866,101 +1982,9 @@ int main(int argc, char *argv[])
 
     open_connections();
 
-    /* Defaults for media sockets */
-    if (media_ip[0] == '\0') {
-        strcpy(media_ip, local_ip);
-    }
-    if (media_ip_escaped[0] == '\0') {
-        // Use get_host_and_port to remove square brackets from an
-        // IPv6 address
-        get_host_and_port(local_ip, media_ip_escaped, NULL);
-    }
-    if (local_ip_is_ipv6) {
-        media_ip_is_ipv6 = true;
-    } else {
-        media_ip_is_ipv6 = false;
-    }
-
     /* Always create and Bind RTP socket */
-    /* to avoid ICMP                     */
-    if (1) {
-        /* retrieve RTP local addr */
-        struct addrinfo   hints;
-        struct addrinfo * local_addr;
-
-        memset((char*)&hints, 0, sizeof(hints));
-        hints.ai_flags  = AI_PASSIVE;
-        hints.ai_family = PF_UNSPEC;
-
-        /* Resolving local IP */
-        if (getaddrinfo(media_ip,
-                        NULL,
-                        &hints,
-                        &local_addr) != 0) {
-            ERROR("Unknown RTP address '%s'.\n"
-                  "Use 'sipp -h' for details", media_ip);
-        }
-
-        memset(&media_sockaddr,0,sizeof(struct sockaddr_storage));
-        media_sockaddr.ss_family = local_addr->ai_addr->sa_family;
-
-        memcpy(&media_sockaddr,
-               local_addr->ai_addr,
-               local_addr->ai_addrlen);
-        freeaddrinfo(local_addr);
-
-        if ((media_socket = socket(media_ip_is_ipv6 ? AF_INET6 : AF_INET,
-                                   SOCK_DGRAM, 0)) == -1) {
-            ERROR_NO("Unable to get the audio RTP socket (IP=%s, port=%d)",
-                     media_ip, media_port);
-        }
-        /* create a second socket for video */
-        if ((media_socket_video = socket(media_ip_is_ipv6 ? AF_INET6 : AF_INET,
-                                         SOCK_DGRAM, 0)) == -1) {
-            ERROR_NO("Unable to get the video RTP socket (IP=%s, port=%d)",
-                     media_ip, media_port + 2);
-        }
-
-        int try_counter;
-        int max_tries = user_media_port ? 1 : 100;
-        media_port = user_media_port ? user_media_port : DEFAULT_MEDIA_PORT;
-        for (try_counter = 0; try_counter < max_tries; try_counter++) {
-            sockaddr_update_port(&media_sockaddr, media_port);
-
-            // Use get_host_and_port to remove square brackets from an
-            // IPv6 address
-            get_host_and_port(media_ip, media_ip_escaped, NULL);
-
-            if (::bind(media_socket, (sockaddr*)&media_sockaddr,
-                       socklen_from_addr(&media_sockaddr)) == 0) {
-                break;
-            }
-
-            media_port++;
-        }
-
-        if (try_counter >= max_tries) {
-            ERROR_NO("Unable to bind audio RTP socket (IP=%s, port=%d)", media_ip, media_port);
-        }
-
-        /*---------------------------------------------------------
-           Bind the second socket to media_port+2
-           (+1 is reserved for RTCP)
-        ----------------------------------------------------------*/
-
-        sockaddr_update_port(&media_sockaddr, media_port + 2);
-
-        // Use get_host_and_port to remove square brackets from an
-        // IPv6 address
-        get_host_and_port(media_ip, media_ip_escaped, NULL);
-
-        if (::bind(media_socket_video, (sockaddr*)&media_sockaddr,
-                   socklen_from_addr(&media_sockaddr))) {
-            ERROR_NO("Unable to bind video RTP socket (IP=%s, port=%d)",
-                     media_ip, media_port + 2);
-        }
-        /* Second socket bound */
-    }
+    /* to avoid ICMP errors from us. */
+    setup_media_sockets();
 
     /* Creating the remote control socket thread. */
     setup_ctrl_socket();
@@ -1968,35 +1992,22 @@ int main(int argc, char *argv[])
         setup_stdin_socket();
     }
 
-    if ((media_socket > 0) && (rtp_echo_enabled)) {
-        if (pthread_create
-                (&pthread2_id,
-                 NULL,
-                 (void *(*)(void *)) rtp_echo_thread,
-                 &media_socket)
-                == -1) {
+    if (rtp_echo_enabled && media_socket_audio > 0) {
+        if (pthread_create(&pthread2_id, NULL,
+                (void *(*)(void *))rtp_echo_thread, &media_socket_audio) == -1) {
             ERROR_NO("Unable to create RTP echo thread");
         }
     }
 
     /* Creating second RTP echo thread for video. */
-    if ((media_socket_video > 0) && (rtp_echo_enabled)) {
-        if (pthread_create
-                (&pthread3_id,
-                 NULL,
-                 (void *(*)(void *)) rtp_echo_thread,
-                 &media_socket_video)
-                == -1) {
-            ERROR_NO("Unable to create second RTP echo thread");
+    if (rtp_echo_enabled && media_socket_video > 0) {
+        if (pthread_create(&pthread3_id, NULL,
+                (void *(*)(void *)) rtp_echo_thread, &media_socket_video) == -1) {
+            ERROR_NO("Unable to create video RTP echo thread");
         }
     }
 
-    if (traffic_thread()) {
-        if (!nostdin) {
-            stdin_socket->close();
-        }
-        ctrl_socket->close();
-    }
+    traffic_thread();
 
     /* Cancel and join other threads. */
     if (pthread2_id) {
@@ -2017,10 +2028,6 @@ int main(int argc, char *argv[])
     free(epollevents);
 #endif
 
-    if (local_addr_storage) {
-        freeaddrinfo(local_addr_storage);
-    }
     free(scenario_file);
-
     sipp_exit(EXIT_TEST_RES_UNKNOWN);
 }

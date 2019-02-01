@@ -84,10 +84,6 @@
 #include "reporttask.hpp"
 #include "ratetask.hpp"
 #include "watchdog.hpp"
-/* Open SSL stuff */
-#ifdef USE_OPENSSL
-#include "sslcommon.h"
-#endif
 
 /*
  * If this files is included in the Main, then extern definitions
@@ -115,7 +111,7 @@
 #define T_TLS                      2
 #define T_SCTP                     3
 
-#ifdef USE_OPENSSL
+#ifdef USE_TLS
 #define DEFAULT_TLS_CERT           "cacert.pem"
 #define DEFAULT_TLS_KEY            "cakey.pem"
 #define DEFAULT_TLS_CRL            ""
@@ -235,8 +231,8 @@ extern int                max_sched_loops         _DEFVAL(MAX_SCHED_LOOPS_PER_CY
 
 extern unsigned int       global_t2               _DEFVAL(DEFAULT_T2_TIMER_VALUE);
 
-extern char               local_ip[40];
-extern char               local_ip_escaped[42];
+extern char               local_ip[127];          /* also used for hostnames */
+extern char               local_ip_escaped[42];   /* with [brackets] in case of IPv6 */
 extern bool               local_ip_is_ipv6;
 extern int                local_port              _DEFVAL(0);
 #ifdef USE_SCTP
@@ -261,14 +257,13 @@ extern int                rtp_buffsize            _DEFVAL(65535);
 #endif
 
 extern bool               rtp_echo_enabled        _DEFVAL(0);
-extern char               media_ip[40];
-extern char               media_ip_escaped[42];
+extern char               media_ip[127];          /* also used for hostnames */
 extern int                user_media_port         _DEFVAL(0);
 extern int                media_port              _DEFVAL(0);
 extern size_t             media_bufsize           _DEFVAL(2048);
 extern_c bool             media_ip_is_ipv6        _DEFVAL(false);
-extern char               remote_ip[40];
-extern char               remote_ip_escaped[42];
+extern char               remote_ip[127];         /* also used for hostnames */
+extern char               remote_ip_escaped[42];  /* with [brackets] in case of IPv6 */
 extern int                remote_port             _DEFVAL(DEFAULT_PORT);
 extern unsigned int       pid                     _DEFVAL(0);
 extern bool               print_all_responses     _DEFVAL(false);
@@ -316,17 +311,15 @@ extern unsigned int       tdm_map_z               _DEFVAL(0);
 extern unsigned int       tdm_map_h               _DEFVAL(0);
 extern bool               tdm_map[1024];
 
-#ifdef USE_OPENSSL
-extern BIO              * twinSipp_bio;
-extern SSL              * twinSipp_ssl;
+#ifdef USE_TLS
 extern const char       * tls_cert_name           _DEFVAL(DEFAULT_TLS_CERT);
 extern const char       * tls_key_name            _DEFVAL(DEFAULT_TLS_KEY);
 extern const char       * tls_crl_name            _DEFVAL(DEFAULT_TLS_CRL);
-
+extern double             tls_version             _DEFVAL(0.0);
 #endif
 
 extern char*              scenario_file           _DEFVAL(NULL);
-extern_c char*              scenario_path         _DEFVAL(NULL);
+extern_c char*            scenario_path           _DEFVAL(NULL);
 
 // extern field file management
 typedef std::map<string, FileContents *> file_map;
@@ -421,8 +414,8 @@ extern  int stepDynamicId   _DEFVAL(4);      // step of increment for dynamicId
 extern SIPpSocket   *main_socket                  _DEFVAL(NULL);
 extern SIPpSocket   *main_remote_socket           _DEFVAL(NULL);
 extern SIPpSocket   *tcp_multiplex                _DEFVAL(NULL);
-extern int           media_socket                 _DEFVAL(0);
-extern int           media_socket_video           _DEFVAL(0);
+extern int media_socket_audio                     _DEFVAL(0);
+extern int media_socket_video                     _DEFVAL(0);
 
 extern struct sockaddr_storage local_sockaddr;
 extern struct sockaddr_storage localTwin_sockaddr;
@@ -436,7 +429,7 @@ extern bool          sendbuffer_warn              _DEFVAL(false);
 /* A list of sockets pending reset. */
 extern set<SIPpSocket*> sockets_pending_reset;
 
-extern struct addrinfo *local_addr_storage;
+extern struct sockaddr_storage local_addr_storage;
 
 extern SIPpSocket   *twinSippSocket               _DEFVAL(NULL);
 extern SIPpSocket   *localTwinSippSocket          _DEFVAL(NULL);

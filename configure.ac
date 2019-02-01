@@ -84,13 +84,26 @@ case "$host" in
         ;;
 esac
 
+AC_CHECK_PROG([have_pkgconfig], [pkg-config], [yes], [no])
+
 # ==================== checks for libraries =============================
-AC_CHECK_LIB(curses,initscr)
-if test x$ac_cv_lib_curses_initscr = xno; then
-    AC_CHECK_LIB(ncurses,initscr)
-    if test x$ac_cv_lib_ncurses_initscr = xno; then
-        AC_MSG_ERROR([ncurses library missing])
-    fi
+
+if test "$have_pkgconfig" = "yes"; then
+    # Use pkg-config when available
+    PKG_PROG_PKG_CONFIG()
+    PKG_CHECK_MODULES([ncurses], [ncurses],
+        LIBS="$LIBS $ncurses_LIBS",
+        [PKG_CHECK_MODULES([curses], [curses],
+            LIBS="$LIBS $curses_LIBS",
+            # On OSX we don't get pkg-config for (n)curses.
+            [AC_SEARCH_LIBS([initscr], [ncurses curses],,
+                AC_ERROR([Missing (n)curses library]))]
+        )]
+    )
+else
+    # Olden ways
+    AC_SEARCH_LIBS([initscr], [ncurses curses],,AC_ERROR([Missing (n)curses library]))
+    AC_SEARCH_LIBS([stdscr], [tinfo ncurses curses],,AC_ERROR([Missing (n)curses/tinfo library]))
 fi
 
 AC_CHECK_LIB(pthread, pthread_mutex_init, THREAD_LIBS="-lpthread",
@@ -150,8 +163,8 @@ if test "$openssl" = 'yes'; then
     AC_CHECK_HEADERS([openssl/rand.h],,[AC_MSG_ERROR([<openssl/rand.h> header missing])])
     AC_CHECK_HEADERS([openssl/ssl.h],,[AC_MSG_ERROR([<openssl/ssl.h> header missing])])
     AC_CHECK_HEADERS([openssl/x509v3.h],,[AC_MSG_ERROR([<openssl/x509v3.h> header missing])])
-    AC_CHECK_LIB([ssl], [SSL_library_init],,[AC_MSG_ERROR([ssl library missing])])
-    AC_CHECK_LIB([crypto], [CRYPTO_num_locks],,[AC_MSG_ERROR([crypto library missing])])
+    AC_CHECK_LIB([ssl], [SSL_CTX_new],,[AC_MSG_ERROR([ssl library missing])])
+    AC_CHECK_LIB([crypto], [CRYPTO_free],,[AC_MSG_ERROR([crypto library missing])])
 fi
 # For Makefile.am
 AM_CONDITIONAL(HAVE_OPENSSL, test "$openssl" = "yes")
@@ -180,8 +193,11 @@ AM_CONDITIONAL(HAVE_PCAP, test "$pcap" = "yes")
 
 AM_CONDITIONAL(HAVE_RTP, test "$rtp" = "yes")
 
-# Conditional build with pcap
-if test "$gsl" = 'yes'; then
+# Conditional build with gsl
+if test "$gsl" = "yes"; then
+    if test "$have_pkgconfig" != "yes" ; then
+        AC_MSG_ERROR([Please install pkg-config to use the gsl libraries])
+    fi
     AC_CHECK_HEADERS([gsl/gsl_randist.h],,[AC_MSG_ERROR([<gsl/gsl_randist.h> header missing])])
     AC_CHECK_HEADERS([gsl/gsl_rng.h],,[AC_MSG_ERROR([<gsl/gsl_rng.h> header missing])])
     AC_CHECK_HEADERS([gsl/gsl_cdf.h],,[AC_MSG_ERROR([<gsl/gsl_cdf.h> header missing])])

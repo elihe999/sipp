@@ -15,7 +15,7 @@ AM_CPPFLAGS=-D_BSD_SOURCE -D_DEFAULT_SOURCE
 
 CLEANFILES =
 EXTRA_DIST = \
-	$(srcdir)/src/fortune.cpp \
+	$(srcdir)/example/fortune.cpp \
 	$(srcdir)/LICENSE.txt \
 	$(srcdir)/README.md \
 	$(srcdir)/THANKS \
@@ -23,13 +23,12 @@ EXTRA_DIST = \
 	$(srcdir)/cpplint.py
 
 if HAVE_OPENSSL
-DEFS += -DUSE_OPENSSL
+DEFS += -DUSE_TLS -DUSE_OPENSSL
 ssl_incl = \
-	include/sslcommon.h
+	include/sslsocket.hpp
 ssl_SOURCES = \
 	$(ssl_incl) \
-	src/sslinit.c \
-	src/sslthreadsafe.c
+	src/sslsocket.cpp
 endif
 
 if HAVE_PCAP

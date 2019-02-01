@@ -51,6 +51,7 @@ extern bool show_index;
 SIPpSocket *ctrl_socket = NULL;
 SIPpSocket *stdin_socket = NULL;
 
+static int stdin_fileno = -1;
 static int stdin_mode;
 
 /******************** Recv Poll Processing *********************/
@@ -342,46 +343,6 @@ static const char* get_trimmed_call_id(const char* msg)
     return call_id;
 }
 
-#ifdef USE_OPENSSL
-SSL_CTX  *sip_trp_ssl_ctx = NULL; /* For SSL cserver context */
-SSL_CTX  *sip_trp_ssl_ctx_client = NULL; /* For SSL cserver context */
-SSL_CTX  *twinSipp_sip_trp_ssl_ctx_client = NULL; /* For SSL cserver context */
-
-#define CALL_BACK_USER_DATA "ksgr"
-
-int passwd_call_back_routine(char *buf, int size, int /*flag*/, void *passwd)
-{
-    strncpy(buf, (char *)(passwd), size);
-    buf[size - 1] = '\0';
-    return(strlen(buf));
-}
-
-/****** SSL error handling *************/
-const char *sip_tls_error_string(SSL *ssl, int size)
-{
-    int err;
-    err=SSL_get_error(ssl, size);
-    switch(err) {
-    case SSL_ERROR_NONE:
-        return "No error";
-    case SSL_ERROR_WANT_WRITE:
-        return "SSL_read returned SSL_ERROR_WANT_WRITE";
-    case SSL_ERROR_WANT_READ:
-        return "SSL_read returned SSL_ERROR_WANT_READ";
-    case SSL_ERROR_WANT_X509_LOOKUP:
-        return "SSL_read returned SSL_ERROR_WANT_X509_LOOKUP";
-    case SSL_ERROR_SYSCALL:
-        if (size < 0) { /* not EOF */
-            return strerror(errno);
-        } else { /* EOF */
-            return "SSL socket closed on SSL_read";
-        }
-    }
-    return "Unknown SSL Error.";
-}
-
-#endif
-
 static char* get_inet_address(const struct sockaddr_storage* addr, char* dst, int len)
 {
     if (getnameinfo(_RCAST(struct sockaddr*, addr), socklen_from_addr(addr),
@@ -527,7 +488,7 @@ void setup_ctrl_socket()
     int try_counter = 60;
     struct sockaddr_storage ctl_sa;
 
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == -1) {
         ERROR_NO("Unable to create remote control socket!");
     }
@@ -583,16 +544,19 @@ void setup_ctrl_socket()
     }
 }
 
-static void reset_stdin() {
-    fcntl(fileno(stdin), F_SETFL, stdin_mode);
+void reset_stdin()
+{
+    fcntl(stdin_fileno, F_SETFL, stdin_mode);
 }
 
 void setup_stdin_socket()
 {
-    stdin_mode = fcntl(fileno(stdin), F_GETFL);
-    fcntl(fileno(stdin), F_SETFL, stdin_mode | O_NONBLOCK);
+    stdin_fileno = fileno(stdin);
+    stdin_mode = fcntl(stdin_fileno, F_GETFL);
     atexit(reset_stdin);
-    stdin_socket = new SIPpSocket(0, T_UDP, fileno(stdin), 0);
+    fcntl(stdin_fileno, F_SETFL, stdin_mode | O_NONBLOCK);
+
+    stdin_socket = new SIPpSocket(0, T_TCP, stdin_fileno, 0);
     if (!stdin_socket) {
         ERROR_NO("Could not setup keyboard (stdin) socket!\n");
     }
@@ -993,14 +957,12 @@ void SIPpSocket::invalidate()
         }
 #endif
 
-        if (::close(ss_fd) < 0) {
+        if (ss_fd == stdin_fileno) {
+            /* don't close stdin, breaks interactive terminals */
+        } else if (::close(ss_fd) < 0) {
             WARNING_NO("Failed to close socket %d", ss_fd);
         }
-        else {
-            ss_fd = -1;
-        }
-
-        abort();
+        ss_fd = -1;
     }
 
     if ((pollidx = ss_pollidx) >= pollnfds) {
@@ -1031,8 +993,11 @@ void SIPpSocket::invalidate()
 #else
     pollfiles[pollidx] = pollfiles[pollnfds];
 #endif
-    sockets[pollidx] = sockets[pollnfds];
-    sockets[pollidx]->ss_pollidx = pollidx;
+    /* If unequal, move the last valid socket here. */
+    if (pollidx != pollnfds) {
+        sockets[pollidx] = sockets[pollnfds];
+        sockets[pollidx]->ss_pollidx = pollidx;
+    }
     sockets[pollnfds] = NULL;
 
     if (ss_msglen) {
@@ -1284,6 +1249,7 @@ SIPpSocket::SIPpSocket(bool use_ipv6, int transport, int fd, int accepting):
     ss_transport(transport),
     ss_control(false),
     ss_fd(fd),
+    ss_bind_port(0),
     ss_comp_state(NULL),
     ss_changed_dest(false),
     ss_congested(false),
@@ -1298,12 +1264,12 @@ SIPpSocket::SIPpSocket(bool use_ipv6, int transport, int fd, int accepting):
 #ifdef USE_OPENSSL
     ss_ssl = NULL;
 
-    if ( transport == T_TLS ) {
+    if (transport == T_TLS) {
         if ((ss_bio = BIO_new_socket(fd, BIO_NOCLOSE)) == NULL) {
             ERROR("Unable to create BIO object:Problem with BIO_new_socket()\n");
         }
 
-        if (!(ss_ssl = SSL_new(accepting ? sip_trp_ssl_ctx : sip_trp_ssl_ctx_client))) {
+        if (!(ss_ssl = (accepting ? SSL_new_server() : SSL_new_client()))) {
             ERROR("Unable to create SSL object : Problem with SSL_new() \n");
         }
 
@@ -1362,6 +1328,7 @@ static int socket_fd(bool use_ipv6, int transport)
 #endif
     case T_TCP:
         socket_type = SOCK_STREAM;
+        protocol = IPPROTO_TCP;
         break;
     }
 
@@ -1462,27 +1429,22 @@ SIPpSocket* SIPpSocket::accept() {
 
     if (ret->ss_transport == T_TLS) {
 #ifdef USE_OPENSSL
-        int ret;
-        int ii = 0;
-        while ((ret = SSL_accept(ss_ssl)) < 0) {
-            int err = SSL_get_error(ss_ssl, ret);
+        int rc;
+        int i = 0;
+        while ((rc = SSL_accept(ret->ss_ssl)) < 0) {
+            int err = SSL_get_error(ret->ss_ssl, rc);
             if ((err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) &&
-                ii < SIPP_SSL_MAX_RETRIES) {
+                    i < SIPP_SSL_MAX_RETRIES) {
                 /* These errors are benign we just need to wait for the socket
                  * to be readable/writable again. */
                 WARNING("SSL_accept failed with error: %s. Attempt %d. "
-                        "Retrying...",
-                        sip_tls_error_string(ss_ssl, ret),
-                        ii + 1);
-                ii++;
+                        "Retrying...", SSL_error_string(err, rc), ++i);
                 sipp_usleep(SIPP_SSL_RETRY_TIMEOUT);
                 continue;
             }
-            else {
-                ERROR("Error in SSL_accept: %s\n",
-                      sip_tls_error_string(ss_ssl, ret));
-                break;
-            }
+            ERROR("Error in SSL_accept: %s\n",
+                  SSL_error_string(err, rc));
+            break;
         }
 #else
         ERROR("You need to compile SIPp with TLS support");
@@ -1546,6 +1508,11 @@ int sipp_bind_socket(SIPpSocket *socket, struct sockaddr_storage *saddr, int *po
     return 0;
 }
 
+void SIPpSocket::set_bind_port(int bind_port)
+{
+    ss_bind_port = bind_port;
+}
+
 int SIPpSocket::connect(struct sockaddr_storage* dest)
 {
     if (dest)
@@ -1558,22 +1525,21 @@ int SIPpSocket::connect(struct sockaddr_storage* dest)
     assert(ss_transport == T_TCP || ss_transport == T_TLS || ss_transport == T_SCTP);
 
     if (ss_transport == T_TCP || ss_transport == T_TLS) {
-        struct sockaddr_storage local_without_port;
+        struct sockaddr_storage with_optional_port;
         int port = -1;
-        memcpy(&local_without_port, &local_sockaddr, sizeof(struct sockaddr_storage));
+        memcpy(&with_optional_port, &local_sockaddr, sizeof(struct sockaddr_storage));
         if (local_ip_is_ipv6) {
-            (_RCAST(struct sockaddr_in6 *, &local_without_port))->sin6_port = htons(0);
+            (_RCAST(struct sockaddr_in6*, &with_optional_port))->sin6_port = htons(ss_bind_port);
         } else {
-            (_RCAST(struct sockaddr_in *, &local_without_port))->sin_port = htons(0);
+            (_RCAST(struct sockaddr_in*, &with_optional_port))->sin_port = htons(ss_bind_port);
         }
-        sipp_bind_socket(this, &local_without_port, &port);
-    }
+        sipp_bind_socket(this, &with_optional_port, &port);
 #ifdef USE_SCTP
-    if (ss_transport == T_SCTP) {
+    } else if (ss_transport == T_SCTP) {
         int port = -1;
         sipp_bind_socket(this, &local_sockaddr, &port);
-    }
 #endif
+    }
 
     int flags = fcntl(ss_fd, F_GETFL, 0);
     fcntl(ss_fd, F_SETFL, flags | O_NONBLOCK);
@@ -1594,25 +1560,21 @@ int SIPpSocket::connect(struct sockaddr_storage* dest)
 
     if (ss_transport == T_TLS) {
 #ifdef USE_OPENSSL
-        int ii = 0;
-        while ((ret = SSL_connect(ss_ssl)) < 0) {
-            int err = SSL_get_error(ss_ssl, ret);
+        int rc;
+        int i = 0;
+        while ((rc = SSL_connect(ss_ssl)) < 0) {
+            int err = SSL_get_error(ss_ssl, rc);
             if ((err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) &&
-                ii < SIPP_SSL_MAX_RETRIES) {
+                    i < SIPP_SSL_MAX_RETRIES) {
                 /* These errors are benign we just need to wait for the socket
                  * to be readable/writable again. */
                 WARNING("SSL_connect failed with error: %s. Attempt %d. "
-                        "Retrying...",
-                        sip_tls_error_string(ss_ssl, ret),
-                        ii + 1);
-                ii++;
+                        "Retrying...", SSL_error_string(err, rc), ++i);
                 sipp_usleep(SIPP_SSL_RETRY_TIMEOUT);
                 continue;
             }
-            else {
-                ERROR("Error in SSL connection: %s\n",
-                      sip_tls_error_string(ss_ssl, ret));
-            }
+            ERROR("Error in SSL connection: %s\n", SSL_error_string(err, rc));
+            break;
         }
 #else
         ERROR("You need to compile SIPp with TLS support");
@@ -1651,7 +1613,7 @@ int SIPpSocket::reconnect()
                 ERROR("Unable to create BIO object:Problem with BIO_new_socket()\n");
             }
 
-            if (!(ss_ssl = SSL_new(sip_trp_ssl_ctx_client))) {
+            if (!(ss_ssl = SSL_new_client())) {
                 ERROR("Unable to create SSL object : Problem with SSL_new() \n");
             }
 
@@ -1913,7 +1875,7 @@ int SIPpSocket::write_error(int ret)
 
 #ifdef USE_OPENSSL
     if (ss_transport == T_TLS) {
-        errstring = sip_tls_error_string(ss_ssl, ret);
+        errstring = SSL_error_string(SSL_get_error(ss_ssl, ret), ret);
     }
 #endif
 
@@ -1928,13 +1890,12 @@ int SIPpSocket::read_error(int ret)
 #ifdef USE_OPENSSL
     if (ss_transport == T_TLS) {
         int err = SSL_get_error(ss_ssl, ret);
-        errstring = sip_tls_error_string(ss_ssl, ret);
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
             /* This is benign - we just need to wait for the socket to be
              * readable/writable again, which will happen naturally as part
              * of the poll/epoll loop. */
             WARNING("SSL_read failed with error: %s. Retrying...",
-                    errstring);
+                    SSL_error_string(err, ret));
             return 1;
         }
     }
@@ -1952,7 +1913,7 @@ int SIPpSocket::read_error(int ret)
     /* We have only non-blocking reads, so this should not occur. The OpenSSL
      * functions don't set errno, though, so this check doesn't make sense
      * for TLS sockets. */
-    if ((ret < 0) && (ss_transport != T_TLS)) {
+    if (ret < 0 && ss_transport != T_TLS) {
         assert(errno != EAGAIN);
     }
 
@@ -2045,149 +2006,15 @@ void SIPpSocket::buffer_read(struct socketbuf *newbuf)
 
 #ifdef USE_OPENSSL
 
-/****** Certificate Verification Callback FACILITY *************/
-int sip_tls_verify_callback(int ok , X509_STORE_CTX *store)
-{
-    char data[512];
-
-    if (!ok) {
-        X509 *cert = X509_STORE_CTX_get_current_cert(store);
-
-        X509_NAME_oneline(X509_get_issuer_name(cert),
-                          data, 512);
-        WARNING("TLS verification error for issuer: '%s'", data);
-        X509_NAME_oneline(X509_get_subject_name(cert),
-                          data, 512);
-        WARNING("TLS verification error for subject: '%s'", data);
-    }
-    return ok;
-}
-
-/***********  Load the CRL's into SSL_CTX **********************/
-static int sip_tls_load_crls(SSL_CTX* ctx , const char* crlfile)
-{
-    X509_STORE          *store;
-    X509_LOOKUP         *lookup;
-
-    /*  Get the X509_STORE from SSL context */
-    if (!(store = SSL_CTX_get_cert_store(ctx))) {
-        return (-1);
-    }
-
-    /* Add lookup file to X509_STORE */
-    if (!(lookup = X509_STORE_add_lookup(store, X509_LOOKUP_file()))) {
-        return (-1);
-    }
-
-    /* Add the CRLS to the lookpup object */
-    if (X509_load_crl_file(lookup, crlfile, X509_FILETYPE_PEM) != 1) {
-        return (-1);
-    }
-
-    /* Set the flags of the store so that CRLS's are consulted */
-#if OPENSSL_VERSION_NUMBER >= 0x00907000L
-    X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
-#else
-#warning This version of OpenSSL (<0.9.7) cannot handle CRL files in capath
-    ERROR("This version of OpenSSL (<0.9.7) cannot handle CRL files in capath");
-#endif
-
-    return (1);
-}
-
-/************* Prepare the SSL context ************************/
-ssl_init_status FI_init_ssl_context (void)
-{
-    sip_trp_ssl_ctx = SSL_CTX_new( TLSv1_method() );
-    if ( sip_trp_ssl_ctx == NULL ) {
-        ERROR("FI_init_ssl_context: SSL_CTX_new with TLSv1_method failed");
-        return SSL_INIT_ERROR;
-    }
-
-    sip_trp_ssl_ctx_client = SSL_CTX_new( TLSv1_method() );
-    if ( sip_trp_ssl_ctx_client == NULL) {
-        ERROR("FI_init_ssl_context: SSL_CTX_new with TLSv1_method failed");
-        return SSL_INIT_ERROR;
-    }
-
-    /*  Load the trusted CA's */
-    SSL_CTX_load_verify_locations(sip_trp_ssl_ctx, tls_cert_name, NULL);
-    SSL_CTX_load_verify_locations(sip_trp_ssl_ctx_client, tls_cert_name, NULL);
-
-    /*  CRL load from application specified only if specified on the command line */
-    if (strlen(tls_crl_name) != 0) {
-        if (sip_tls_load_crls(sip_trp_ssl_ctx, tls_crl_name) == -1) {
-            ERROR("FI_init_ssl_context: Unable to load CRL file (%s)", tls_crl_name);
-            return SSL_INIT_ERROR;
-        }
-
-        if (sip_tls_load_crls(sip_trp_ssl_ctx_client, tls_crl_name) == -1) {
-            ERROR("FI_init_ssl_context: Unable to load CRL (client) file (%s)", tls_crl_name);
-            return SSL_INIT_ERROR;
-        }
-        /* The following call forces to process the certificates with the */
-        /* initialised SSL_CTX                                            */
-        SSL_CTX_set_verify(sip_trp_ssl_ctx,
-                           SSL_VERIFY_PEER |
-                           SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
-                           sip_tls_verify_callback);
-
-        SSL_CTX_set_verify(sip_trp_ssl_ctx_client,
-                           SSL_VERIFY_PEER |
-                           SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
-                           sip_tls_verify_callback);
-    }
-
-
-    /* Selection Cipher suits - load the application specified ciphers */
-    SSL_CTX_set_default_passwd_cb_userdata(sip_trp_ssl_ctx,
-                                           (void *)CALL_BACK_USER_DATA );
-    SSL_CTX_set_default_passwd_cb_userdata(sip_trp_ssl_ctx_client,
-                                           (void *)CALL_BACK_USER_DATA );
-    SSL_CTX_set_default_passwd_cb( sip_trp_ssl_ctx,
-                                   passwd_call_back_routine );
-    SSL_CTX_set_default_passwd_cb( sip_trp_ssl_ctx_client,
-                                   passwd_call_back_routine );
-
-    if ( SSL_CTX_use_certificate_file(sip_trp_ssl_ctx,
-                                      tls_cert_name,
-                                      SSL_FILETYPE_PEM ) != 1 ) {
-        ERROR("FI_init_ssl_context: SSL_CTX_use_certificate_file failed");
-        return SSL_INIT_ERROR;
-    }
-
-    if ( SSL_CTX_use_certificate_file(sip_trp_ssl_ctx_client,
-                                      tls_cert_name,
-                                      SSL_FILETYPE_PEM ) != 1 ) {
-        ERROR("FI_init_ssl_context: SSL_CTX_use_certificate_file (client) failed");
-        return SSL_INIT_ERROR;
-    }
-    if ( SSL_CTX_use_PrivateKey_file(sip_trp_ssl_ctx,
-                                     tls_key_name,
-                                     SSL_FILETYPE_PEM ) != 1 ) {
-        ERROR("FI_init_ssl_context: SSL_CTX_use_PrivateKey_file failed");
-        return SSL_INIT_ERROR;
-    }
-
-    if ( SSL_CTX_use_PrivateKey_file(sip_trp_ssl_ctx_client,
-                                     tls_key_name,
-                                     SSL_FILETYPE_PEM ) != 1 ) {
-        ERROR("FI_init_ssl_context: SSL_CTX_use_PrivateKey_file (client) failed");
-        return SSL_INIT_ERROR;
-    }
-
-    return SSL_INIT_NORMAL;
-}
-
 static int send_nowait_tls(SSL* ssl, const void* msg, int len, int /*flags*/)
 {
     int initial_fd_flags;
     int rc;
     int fd;
     int fd_flags;
-    int ii = 0;
-    if ( (fd = SSL_get_fd(ssl)) == -1 ) {
-        return (-1);
+    int i = 0;
+    if ((fd = SSL_get_fd(ssl)) == -1) {
+        return -1;
     }
     fd_flags = fcntl(fd, F_GETFL, NULL);
     initial_fd_flags = fd_flags;
@@ -2196,23 +2023,18 @@ static int send_nowait_tls(SSL* ssl, const void* msg, int len, int /*flags*/)
     while ((rc = SSL_write(ssl, msg, len)) < 0) {
         int err = SSL_get_error(ssl, rc);
         if ((err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) &&
-            ii < SIPP_SSL_MAX_RETRIES) {
+                i < SIPP_SSL_MAX_RETRIES) {
             /* These errors are benign we just need to wait for the socket
              * to be readable/writable again. */
             WARNING("SSL_write failed with error: %s. Attempt %d. "
-                    "Retrying...",
-                    sip_tls_error_string(ssl, rc),
-                    ii + 1);
-            ii++;
+                    "Retrying...", SSL_error_string(err, rc), ++i);
             sipp_usleep(SIPP_SSL_RETRY_TIMEOUT);
             continue;
         }
-        else {
-            return(rc);
-        }
+        return rc;
     }
     if (rc == 0) {
-        return(rc);
+        return rc;
     }
     fcntl(fd, F_SETFL, initial_fd_flags);
     return rc;
@@ -2496,6 +2318,7 @@ void SIPpSocket::close_calls()
 int open_connections()
 {
     int status=0;
+    int family_hint = PF_UNSPEC;
     local_port = 0;
 
     if (!strlen(remote_host)) {
@@ -2521,6 +2344,7 @@ int open_connections()
             }
 
             get_inet_address(&remote_sockaddr, remote_ip, sizeof(remote_ip));
+            family_hint = remote_sockaddr.ss_family;
             if (remote_sockaddr.ss_family == AF_INET) {
                 strcpy(remote_ip_escaped, remote_ip);
             } else {
@@ -2530,52 +2354,81 @@ int open_connections()
         }
     }
 
-    if (gethostname(hostname, 64) != 0) {
-        ERROR_NO("Can't get local hostname in 'gethostname(hostname, 64)'");
-    }
-
     {
-        char            * local_host = NULL;
-        struct addrinfo * local_addr;
-        struct addrinfo   hints;
-
-        if (!strlen(local_ip)) {
-            local_host = (char *)hostname;
-        } else {
-            local_host = (char *)local_ip;
-        }
-
-        memset((char*)&hints, 0, sizeof(hints));
-        hints.ai_flags  = AI_PASSIVE;
-        hints.ai_family = PF_UNSPEC;
-
-        /* Resolving local IP */
-        if (getaddrinfo(local_host, NULL, &hints, &local_addr) != 0) {
-            ERROR("Can't get local IP address in getaddrinfo, local_host='%s', local_ip='%s'",
-                  local_host,
-                  local_ip);
-        }
-        // store local addr info for rsa option
-        getaddrinfo(local_host, NULL, &hints, &local_addr_storage);
-
+        /* Yuck. Populate local_sockaddr with "our IP" first, and then
+         * replace it with INADDR_ANY if we did not request a specific
+         * IP to bind on. */
+        bool bind_specific = false;
         memset(&local_sockaddr, 0, sizeof(struct sockaddr_storage));
-        local_sockaddr.ss_family = local_addr->ai_addr->sa_family;
 
-        if (!strlen(local_ip)) {
-            get_inet_address(_RCAST(struct sockaddr_storage*, local_addr->ai_addr),
-                             local_ip, sizeof(local_ip));
+        if (strlen(local_ip) || !strlen(remote_host)) {
+            int ret;
+            struct addrinfo * local_addr;
+            struct addrinfo   hints;
+
+            memset((char*)&hints, 0, sizeof(hints));
+            hints.ai_flags  = AI_PASSIVE;
+            hints.ai_family = family_hint;
+
+            if (strlen(local_ip)) {
+                bind_specific = true;
+            } else {
+                /* Bind on gethostname() IP by default. This is actually
+                 * buggy.  We should be able to bind on :: and decide on
+                 * accept() what Contact IP we use.  Right now, if we do
+                 * that, we'd send [::] in the contact and :: in the RTP
+                 * as "our IP". */
+                if (gethostname(local_ip, sizeof(local_ip)) != 0) {
+                    ERROR_NO("Can't get local hostname");
+                }
+            }
+
+            /* Resolving local IP */
+            if ((ret = getaddrinfo(local_ip, NULL, &hints, &local_addr)) != 0) {
+                if (ret == EAI_ADDRFAMILY) {
+                    ERROR("Network family mismatch for local and remote IP");
+                } else {
+                    ERROR("Can't get local IP address in getaddrinfo, "
+                          "local_ip='%s', ret=%d", local_ip, ret);
+                }
+            }
+            memcpy(&local_sockaddr, local_addr->ai_addr, local_addr->ai_addrlen);
+            freeaddrinfo(local_addr);
+
+            if (!bind_specific) {
+                get_inet_address(&local_sockaddr, local_ip, sizeof(local_ip));
+            }
         } else {
-            memcpy(&local_sockaddr,
-                   local_addr->ai_addr,
-                   local_addr->ai_addrlen);
+            /* Get temp socket on UDP to find out our local address */
+            int tmpsock = -1;
+            socklen_t len = sizeof(local_sockaddr);
+            if ((tmpsock = socket(remote_sockaddr.ss_family, SOCK_DGRAM, IPPROTO_UDP)) < 0 ||
+                    ::connect(tmpsock, _RCAST(struct sockaddr*, &remote_sockaddr),
+                              socklen_from_addr(&remote_sockaddr)) < 0 ||
+                    getsockname(tmpsock, _RCAST(struct sockaddr*, &local_sockaddr), &len) < 0) {
+                if (tmpsock >= 0) {
+                    close(tmpsock);
+                }
+                ERROR_NO("Failed to find our local ip");
+            }
+            close(tmpsock);
+            get_inet_address(&local_sockaddr, local_ip, sizeof(local_ip));
         }
-        freeaddrinfo(local_addr);
 
-        if (local_sockaddr.ss_family == AF_INET6) {
+        /* Store local addr info for rsa option */
+        memcpy(&local_addr_storage, &local_sockaddr, sizeof(local_sockaddr));
+
+        if (local_sockaddr.ss_family == AF_INET) {
+            strcpy(local_ip_escaped, local_ip);
+            if (!bind_specific) {
+                _RCAST(struct sockaddr_in*, &local_sockaddr)->sin_addr.s_addr = INADDR_ANY;
+            }
+        } else {
             local_ip_is_ipv6 = true;
             sprintf(local_ip_escaped, "[%s]", local_ip);
-        } else {
-            strcpy(local_ip_escaped, local_ip);
+            if (!bind_specific) {
+                memcpy(&_RCAST(struct sockaddr_in6*, &local_sockaddr)->sin6_addr, &in6addr_any, sizeof(in6addr_any));
+            }
         }
     }
 
@@ -2700,35 +2553,23 @@ int open_connections()
             ERROR_NO("Unable to get a TCP socket");
         }
 
+        /* If there is a user-supplied local port and we use a single
+         * socket, then bind to the specified port. */
+        if (user_port) {
+            tcp_multiplex->set_bind_port(local_port);
+        }
+
         /* OJA FIXME: is it correct? */
         if (use_remote_sending_addr) {
             remote_sockaddr = remote_sending_sockaddr;
         }
         sipp_customize_socket(tcp_multiplex);
 
-        if (user_port) {
-            int sock_opt = 1;
-
-            if (setsockopt(tcp_multiplex->ss_fd, SOL_SOCKET, SO_REUSEADDR, (void *)&sock_opt,
-                           sizeof (sock_opt)) == -1) {
-                ERROR_NO("setsockopt(SO_REUSEADDR) failed");
-            }
-
-            if (tcp_multiplex->ss_ipv6) {
-                struct sockaddr_in6 sa_loc = {AF_INET6};
-                sa_loc.sin6_port = htons(local_port);
-                sipp_bind_socket(tcp_multiplex, (struct sockaddr_storage*)&sa_loc, NULL);
-            } else {
-                struct sockaddr_in sa_loc = {AF_INET};
-                sa_loc.sin_port = htons(local_port);
-                sipp_bind_socket(tcp_multiplex, (struct sockaddr_storage*)&sa_loc, NULL);
-            }
-        }
-
         if (tcp_multiplex->connect(&remote_sockaddr)) {
             if (reset_number > 0) {
                 WARNING("Failed to reconnect\n");
                 main_socket->close();
+                main_socket = NULL;
                 reset_number--;
                 return 1;
             } else {
@@ -2886,11 +2727,6 @@ void connect_local_twin_socket(char * twinSippHost)
     memset(&localTwin_sockaddr, 0, sizeof(struct sockaddr_storage));
     localTwin_sockaddr.ss_family = is_ipv6 ? AF_INET6 : AF_INET;
     sockaddr_update_port(&localTwin_sockaddr, twinSippPort);
-
-    // add socket option to allow the use of it without the TCP timeout
-    // This allows to re-start the controller B (or slave) without timeout after its exit
-    int reuse = 1;
-    setsockopt(localTwinSippSocket->ss_fd, SOL_SOCKET, SO_REUSEADDR, (int *)&reuse, sizeof(reuse));
     sipp_customize_socket(localTwinSippSocket);
 
     if (sipp_bind_socket(localTwinSippSocket, &localTwin_sockaddr, 0)) {
